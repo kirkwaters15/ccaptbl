@@ -19,6 +19,8 @@ static void
 TransformCutlineToSource( GDALDataset * poDS, OGRFeature *poCutline,
 													OGRGeometry ** ppoMultiPolygon,
                            char **papszTO_In );
+static int GDALExit( int nCode );
+
 void usage(char *name){
 	fprintf(stderr,"%s - calculate table from bivariate CCAP file\n",name);
 	fprintf(stderr,"USAGE: %s -1 year1 -2 year2 -s shapefile -f fieldname [-t table] bivariate_file\n",name);
@@ -54,6 +56,7 @@ int main(int argc, char **argv)
 	table = (unsigned long long *)calloc(sizeof(unsigned long long)*(CCAP_CLASSES+1), sizeof(unsigned long long));
 
 	GDALAllRegister();
+	OGRRegisterAll();
 
 	while((c = getopt(argc,argv,"1:2:t:s:vf:h")) != -1){
 		switch(c){
@@ -123,7 +126,7 @@ int main(int argc, char **argv)
 		/* -------------------------------------------------------------------- */
     //OGRDataSourceH hSrcDS;
 
-		// not really sure this recast is right. Can OGRDataSourceH be cast to GDALDataset?
+		
     hSrcDS = OGROpen( shpname, FALSE, NULL );
     if( hSrcDS == NULL ){
       fprintf(stderr,"Failed to open vector file %s\n",shpname);
@@ -216,7 +219,7 @@ int main(int argc, char **argv)
 		}
     const char *featureVal = (const char *)poFeature->GetFieldAsString(iField);
 
-    
+    fprintf(stderr,"working on feature with field val %s\n",featureVal);
     /*
 		* To Do:
 		* For each raster:
@@ -234,7 +237,7 @@ int main(int argc, char **argv)
 			/*      This gives a WKT version of the feature in the papszWarpOptions */
 			/*      under the CUTLINE field                                         */
 			/* -------------------------------------------------------------------- */
-      
+      fprintf(stderr,"\tTransforming for raster #%d\n",i);
       TransformCutlineToSource( poDataset[i], poFeature,
       													&poMultiPolygon, 
                                
@@ -259,8 +262,11 @@ int main(int argc, char **argv)
 	    int yend = cMaxY >= nYSize[i] ? nYSize[i] : cMaxY + 1 ;
 	    int xmin = fMinX > 0 ? fMinX : 0;
 	    int xmax = cMaxX >= nXSize[i] ? nXSize[i] : cMaxX +1 ;
+	    int xwidth = xmax - xmin;
+	    fprintf(stderr,"\tStarting chunk from line %d to %d width %d\n",ystart,yend, xwidth);
 	    for(y = ystart; y < yend; y++){
-	    	int xwidth = xmax - xmin;
+	    	fprintf(stderr,"\t\tworking on line %d\n",y);
+	    	
 	    	poBand[i]->RasterIO( GF_Read, xmin, y, xwidth, 1, 
 	                          pasScanline, xwidth, 1, GDT_UInt16, 
 	                          0, 0 );
@@ -283,7 +289,7 @@ int main(int argc, char **argv)
 		}
 
 		// have finished a feature, can dump it out
-		for(i = 0; i < CCAP_CLASSES; i++){
+		for(i = 0; i <= CCAP_CLASSES; i++){
 			fprintf(tfp,"%d, %d, %s, %d, %llu\n",year1, year2, featureVal, i, table[i]);
 			table[i] = 0; // clear for the next feature
 		}
@@ -388,19 +394,20 @@ TransformCutlineToSource( GDALDataset * poDS, OGRFeature *poCutline,
         }
     }
 
-    OGRSpatialReference * poCutlineSRS = poMultiPolygon->GetSpatialReference() ;
-    if( hRasterSRS != NULL && poCutlineSRS != NULL )
+    //OGRSpatialReference * poCutlineSRS = poMultiPolygon->GetSpatialReference() ;
+    OGRSpatialReferenceH hCutlineSRS = OGR_G_GetSpatialReference( (OGRGeometryH)poMultiPolygon );
+    if( hRasterSRS != NULL && hCutlineSRS != NULL )
     {
         /* ok, we will reproject */
     }
-    else if( hRasterSRS != NULL && poCutlineSRS == NULL )
+    else if( hRasterSRS != NULL && hCutlineSRS == NULL )
     {
         fprintf(stderr,
                 "Warning : the source raster dataset has a SRS, but the cutline features\n"
                 "not.  We assume that the cutline coordinates are expressed in the destination SRS.\n"
                 "If not, cutline results may be incorrect.\n");
     }
-    else if( hRasterSRS == NULL && poCutlineSRS != NULL )
+    else if( hRasterSRS == NULL && hCutlineSRS != NULL )
     {
         fprintf(stderr,
                 "Warning : the input vector layer has a SRS, but the source raster dataset does not.\n"
@@ -413,11 +420,12 @@ TransformCutlineToSource( GDALDataset * poDS, OGRFeature *poCutline,
 /* -------------------------------------------------------------------- */
 /*      Extract the cutline SRS WKT.                                    */
 /* -------------------------------------------------------------------- */
-    if( poCutlineSRS != NULL )
+    if( hCutlineSRS != NULL )
     {
         char *pszCutlineSRS_WKT = NULL;
 
-        pszCutlineSRS_WKT = poCutlineSRC->exportToWkt(); 
+       // pszCutlineSRS_WKT = poCutlineSRC->exportToWkt();
+        OSRExportToWkt( hCutlineSRS, &pszCutlineSRS_WKT ); 
         papszTO = CSLSetNameValue( papszTO, "DST_SRS", pszCutlineSRS_WKT );
         CPLFree( pszCutlineSRS_WKT );
     }
@@ -447,7 +455,7 @@ TransformCutlineToSource( GDALDataset * poDS, OGRFeature *poCutline,
 
     OGR_G_Transform( (OGRGeometryH) poMultiPolygon, 
                      (OGRCoordinateTransformationH) &oTransformer );
-    ppoMultiPolygon = &poMultiPolygon;
+    *ppoMultiPolygon = poMultiPolygon;
     GDALDestroyGenImgProjTransformer( oTransformer.hSrcImageTransformer );
 
 /* -------------------------------------------------------------------- */
@@ -461,8 +469,34 @@ TransformCutlineToSource( GDALDataset * poDS, OGRFeature *poCutline,
     *ppapszWarpOptions = CSLSetNameValue( *ppapszWarpOptions, 
                                           "CUTLINE", pszWKT );
     CPLFree( pszWKT );*/
+#else
+	fprintf(stderr,"OGR is not enabled! Can't transform vector\n");
+	exit(1);
 #endif
 }
 
+/************************************************************************/
+/*                               GDALExit()                             */
+/*  This function exits and cleans up GDAL and OGR resources            */
+/*  Perhaps it should be added to C api and used in all apps?   
+/* copied from gdalwarp.cpp        */
+/************************************************************************/
 
+static int GDALExit( int nCode )
+{
+  const char  *pszDebug = CPLGetConfigOption("CPL_DEBUG",NULL);
+  if( pszDebug && (EQUAL(pszDebug,"ON") || EQUAL(pszDebug,"") ) )
+  {  
+    GDALDumpOpenDatasets( stderr );
+    CPLDumpSharedList( NULL );
+  }
+
+  GDALDestroyDriverManager();
+
+#ifdef OGR_ENABLED
+  OGRCleanupAll();
+#endif
+
+  exit( nCode );
+}
 

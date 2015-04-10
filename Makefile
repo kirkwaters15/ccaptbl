@@ -4,7 +4,7 @@ SRC=ccap2tbl.cpp
 
 INCLUDE = -I /san1/tcm-i/${ARCH}/include
 LIB=-L /san1/tcm-i/${ARCH}/lib -lgdal
-CPPFLAGS=-g -O $(INCLUDE)
+CPPFLAGS=-g  $(INCLUDE) -D OGR_ENABLED
 CPP=g++
 
 $(PGM): $(OBJ)
