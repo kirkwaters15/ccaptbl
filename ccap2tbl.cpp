@@ -42,18 +42,17 @@ int main(int argc, char **argv)
 	char *shpname = NULL;
 	char *fieldname = NULL;
 	FILE *tfp = stdout;
-	unsigned long long *table;
 	int verbose = 0;
 	GDALDataset *poVDS; // vector data set.
 	OGRDataSourceH hSrcDS; // vector data set.
 	char                **papszTO = NULL; /* options in OPTION=VALUE format, probably not used */
 	
+  std::map <char *, unsigned long long *> tablemap;
 
 
 	extern int optind;
 	extern char *optarg;
 	
-	table = (unsigned long long *)calloc(sizeof(unsigned long long)*(CCAP_CLASSES+1), sizeof(unsigned long long));
 
 	GDALAllRegister();
 	OGRRegisterAll();
@@ -220,6 +219,13 @@ int main(int argc, char **argv)
     const char *featureVal = (const char *)poFeature->GetFieldAsString(iField);
 
     fprintf(stderr,"working on feature with field val %s\n",featureVal);
+
+    unsigned long long *table = NULL;
+    if((table = tablemap.find(featureVal)) == tablemap.end()){
+      // not in the map yet
+      table = (unsigned long long *)calloc(sizeof(unsigned long long)*(CCAP_CLASSES+1), sizeof(unsigned long long));
+      tablemap(featureVal) = table;
+    }
     /*
 		* To Do:
 		* For each raster:
@@ -265,7 +271,7 @@ int main(int argc, char **argv)
 	    int xwidth = xmax - xmin;
 	    fprintf(stderr,"\tStarting chunk from line %d to %d width %d\n",ystart,yend, xwidth);
 	    for(y = ystart; y < yend; y++){
-	    	fprintf(stderr,"\t\tworking on line %d\n",y);
+	    	//fprintf(stderr,"\t\tworking on line %d\n",y);
 	    	
 	    	poBand[i]->RasterIO( GF_Read, xmin, y, xwidth, 1, 
 	                          pasScanline, xwidth, 1, GDT_UInt16, 
@@ -288,12 +294,29 @@ int main(int argc, char **argv)
 	    }
 		}
 
+/*
 		// have finished a feature, can dump it out
 		for(i = 0; i <= CCAP_CLASSES; i++){
-			fprintf(tfp,"%d, %d, %s, %d, %llu\n",year1, year2, featureVal, i, table[i]);
-			table[i] = 0; // clear for the next feature
+      if(table[i] > 0){
+        fprintf(tfp,"%d, %d, %s, %d, %llu\n",year1, year2, featureVal, i, table[i]);
+        table[i] = 0; // clear for the next feature
+      }
 		}
+  */
 	}
+
+  // Done with all features. Can dump the data
+  for( map<char *,unsigned long long>::iterator ii=tablemap.begin(); ii!=tablemap.end(); ++ii) {
+    unsigned long long *table = (*ii).second;
+		for(i = 0; i <= CCAP_CLASSES; i++){
+      if(table[i] > 0){
+        fprintf(tfp,"%d, %d, %s, %d, %llu\n",year1, year2, (*ii).first, i, table[i]);
+      }
+		}
+    free(table);
+
+  }
+
 
 	
 	
