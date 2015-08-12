@@ -2,6 +2,7 @@
 #include <strings.h>
 #include "gdal.h"
 #include "gdal_priv.h"
+#include "gdal_rat.h"
 #include "gdal_alg.h"
 #include "cpl_conv.h"
 #include "cpl_string.h"
@@ -16,6 +17,7 @@
 
 
 static int GDALExit( int nCode );
+GDALColorTable * makeColorTable(char *psFilename);
 
 void usage(char *name){
 	fprintf(stderr,"%s - calculate the bivariate CCAP file from the single date files\n",name);
@@ -33,12 +35,14 @@ int main(int argc, char **argv)
 	int c, i, j;
 	char *shpname = NULL;
 	char *fieldname = NULL;
+	char *psColorTable = NULL;
 	FILE *tfp = stdout;
 	int verbose = 0;
 	GDALDataset *poStartCCAP = NULL;
 	GDALDataset *poEndCCAP = NULL;
 	GDALDataset *poBivariate = NULL;
 	char *psBivariateName = NULL;
+	unsigned int *histogram = NULL;
 
 
 	extern int optind;
@@ -65,8 +69,11 @@ int main(int argc, char **argv)
 
 	
 
-	while((c = getopt(argc,argv,"s:e:o:vh")) != -1){
+	while((c = getopt(argc,argv,"c:s:e:o:vh")) != -1){
 		switch(c){
+			case 'c':
+				psColorTable = optarg; // file name for a colortable (3 column)
+				break;
 			case 's':
 				poStartCCAP = (GDALDataset *)GDALOpen( optarg, GA_ReadOnly );
 				if(poStartCCAP == NULL){
@@ -132,13 +139,8 @@ int main(int argc, char **argv)
 
 	poBivariate->SetProjection(poEndCCAP->GetProjectionRef());
 
-	// initialize the color table for bivariate if we can.
-	if(psColorTable){
-		GDALColorTable *poColorTable = makeColorTable(psColorTable);
-		GDALRasterAttributeTable rat;
-		rat.InitializeFromColorTable(poColorTable);
-	}
-
+	
+	
 	// allocate for a line at a time
 	unsigned char *pasScanlineStart;
 	unsigned char *pasScanlineEnd;
@@ -157,6 +159,21 @@ int main(int argc, char **argv)
 	GDALRasterBand *poBandEnd = poEndCCAP->GetRasterBand( 1 );
 	GDALRasterBand *poBandOut = poBivariate->GetRasterBand( 1 );
 
+	// initialize the color table for bivariate if we can.
+	GDALRasterAttributeTable *poRAT = NULL;
+	if(psColorTable){
+		poRAT = new GDALRasterAttributeTable();
+		GDALColorTable *poColorTable = makeColorTable(psColorTable);
+		poRAT->InitializeFromColorTable(poColorTable);
+		// add fields for histogram
+		poRAT->CreateColumn("Histogram", GFT_Integer, GFU_PixelCount);
+		poBandOut->SetColorTable(poColorTable);
+		poBandOut->SetDefaultRAT(poRAT);
+	}
+	// allocate space for the histogram.
+	GUIntBig *anHistogram = (GUIntBig *)CPLMalloc(sizeof(GUIntBig) * (CCAP_CLASSES * CCAP_CLASSES + 1));
+	for (int i = 0; i < CCAP_CLASSES * CCAP_CLASSES; i++){ anHistogram[i] = 0;}
+
 	// loop over all the rows and output the bivariate.
 	// bivariate value = total_classes * (date1_class -1) + date2_class
 	// if either date entry is zero, the answer is zero.
@@ -167,26 +184,39 @@ int main(int argc, char **argv)
 		for(int x = 0; x < nXSize; x++){
 			unsigned short spix = pasScanlineStart[x];
 			unsigned short epix = pasScanlineEnd[x];
-			if (spix == 0 || epix == 0){
-				pasScanlineOut[x] = 0;
-			}else{
-				pasScanlineOut[x] = CCAP_CLASSES * (spix - 1) + (epix);
-			}
+			unsigned short nclass;
+			nclass = spix && epix ? nclass = CCAP_CLASSES * (spix - 1) + (epix) : 0;
+			pasScanlineOut[x] = nclass;
+			nclass <= CCAP_CLASSES * CCAP_CLASSES && anHistogram[nclass]++;
 		}
 
 		// write out the new line
 		poBandOut->RasterIO(GF_Write, 0,y,nXSize,1,pasScanlineOut,nXSize,1,GDT_UInt16, 0, 0);
 	}
 
+	// set the historgram values in the RAT. Note RAT is ints and we could overflow
+	if(poRAT != NULL){
+		int histcol = poRAT->GetColOfUsage(GFU_PixelCount);
+		for (int i = 0; i < CCAP_CLASSES * CCAP_CLASSES; i++){
+			anHistogram[i] < INT_MAX ? poRAT->SetValue(i,histcol,(int)anHistogram[i]) : poRAT->SetValue(i,histcol,INT_MAX);
+		}
+
+		//if(! poRAT->ChangesAreWrittenToFile()) { poBandOut->SetDefaultRAT(poRAT); }
+	}
+	
+
 	// All done. Close properly
 	GDALClose((GDALDatasetH) poBivariate);
 	GDALClose((GDALDatasetH) poEndCCAP);
 	GDALClose((GDALDatasetH) poStartCCAP);
 
+
+
 	// and deallocate stuff
 	CPLFree(pasScanlineStart);
 	CPLFree(pasScanlineOut);
 	CPLFree(pasScanlineEnd);
+	CPLFree(anHistogram);
 
 	GDALExit(0);
 
@@ -225,13 +255,14 @@ GDALColorTable * makeColorTable(char *psFilename)
 	GDALColorEntry color;
 	GDALColorTable *poColorTable = new GDALColorTable;
 	int index;
-	if((fp == fopen(psFilename,"r")) == NULL){
+	if((fp = fopen(psFilename,"r")) == NULL){
 		fprintf(stderr,"Failed to open colortable file %s\n",psFilename);
 		return NULL;
 	}
-	color.c4 = 1;
-	while(fscanf("%d %hu %hu %hu",&index, &color.c1,&color.c2,&color.c3) == 4){
-		poColorTable->setColorEntry(index, &color);
+	
+	while(fscanf(fp, "%d %hu %hu %hu",&index, &color.c1,&color.c2,&color.c3) == 4){
+		color.c4 = index ? 1 : 0; // index 0 should be transparent for CCAP bivariate.
+		poColorTable->SetColorEntry(index, &color);
 	}
 	fclose(fp);
 
