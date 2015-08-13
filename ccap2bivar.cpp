@@ -18,10 +18,13 @@
 
 static int GDALExit( int nCode );
 GDALColorTable * makeColorTable(char *psFilename);
+void printRGB(const GDALColorEntry *color);
+char **getHFAoptions();
 
 void usage(char *name){
 	fprintf(stderr,"%s - calculate the bivariate CCAP file from the single date files\n",name);
-	fprintf(stderr,"USAGE: %s -s start_ccap -e end_ccap -o bivariate_file\n",name);
+	fprintf(stderr,"USAGE: %s -c colorfile -s start_ccap -e end_ccap -o bivariate_file\n",name);
+	fprintf(stderr,"\tcolorfile = 4 column space separated color file for bivariate (index red green blue)\n");
 	fprintf(stderr,"\tstart_ccap = C-CAP file with first year of data\n");
 	fprintf(stderr,"\tend_ccap = C-CAP file with final year of data\n");
 	fprintf(stderr,"\tbivariate_file = C-CAP bivariate output file\n");
@@ -126,8 +129,12 @@ int main(int argc, char **argv)
 	* but with 16 bit unsigned instead of 8 bit.
 	*/
 	char **papszOptions = NULL;
-	poBivariate = poDriver->Create(psBivariateName, nXSize, nYSize, 1,
-		GDT_UInt16,papszOptions);
+	papszOptions = getHFAoptions();
+	if( (poBivariate = poDriver->Create(psBivariateName, nXSize, nYSize, 1,
+		GDT_UInt16,papszOptions)) == NULL){
+		fprintf(stderr,"Failed to created output file %s\n",psBivariateName);
+		return 1;
+	}
 
 	// add georeferencing and such
 	double adfGeoTransform[6];
@@ -159,16 +166,29 @@ int main(int argc, char **argv)
 	GDALRasterBand *poBandEnd = poEndCCAP->GetRasterBand( 1 );
 	GDALRasterBand *poBandOut = poBivariate->GetRasterBand( 1 );
 
+	if(poBandStart == NULL || poBandEnd == NULL || poBandOut == NULL){
+		fprintf(stderr,"Failed to get one of the bands!\n");
+		GDALExit(1);
+		return 1;
+	}
+
 	// initialize the color table for bivariate if we can.
 	GDALRasterAttributeTable *poRAT = NULL;
+	GDALColorTable *poColorTable = NULL;
 	if(psColorTable){
 		poRAT = new GDALRasterAttributeTable();
-		GDALColorTable *poColorTable = makeColorTable(psColorTable);
-		poRAT->InitializeFromColorTable(poColorTable);
-		// add fields for histogram
-		poRAT->CreateColumn("Histogram", GFT_Integer, GFU_PixelCount);
-		poBandOut->SetColorTable(poColorTable);
-		poBandOut->SetDefaultRAT(poRAT);
+		poColorTable = makeColorTable(psColorTable);
+			if(poColorTable != NULL){
+			poRAT->InitializeFromColorTable(poColorTable);
+			// add fields for histogram
+			poRAT->CreateColumn("Histogram", GFT_Integer, GFU_PixelCount);
+			poBandOut->SetColorTable(poColorTable);
+			poBandOut->SetDefaultRAT(poRAT);
+		}else{
+			fprintf(stderr, "Failed to make the color table from file!\n");
+			delete poRAT;
+			poRAT = NULL;
+		}
 	}
 	// allocate space for the histogram.
 	GUIntBig *anHistogram = (GUIntBig *)CPLMalloc(sizeof(GUIntBig) * (CCAP_CLASSES * CCAP_CLASSES + 1));
@@ -178,8 +198,14 @@ int main(int argc, char **argv)
 	// bivariate value = total_classes * (date1_class -1) + date2_class
 	// if either date entry is zero, the answer is zero.
 	for(int y = 0; y < nYSize; y++){
-		poBandStart->RasterIO( GF_Read, 0, y, nXSize, 1, pasScanlineStart, nXSize, 1, GDT_Byte, 0, 0 );
-		poBandEnd->RasterIO( GF_Read, 0, y, nXSize, 1, pasScanlineEnd, nXSize, 1, GDT_Byte, 0, 0 );
+		if(poBandStart->RasterIO( GF_Read, 0, y, nXSize, 1, pasScanlineStart, nXSize, 1, GDT_Byte, 0, 0 ) != CE_None){
+			fprintf(stderr,"Failed to read the start date data for row %d\n",y);
+			GDALExit(1);
+		}
+		if(poBandEnd->RasterIO( GF_Read, 0, y, nXSize, 1, pasScanlineEnd, nXSize, 1, GDT_Byte, 0, 0 ) != CE_None){
+			fprintf(stderr,"Failed to read the end date data for row %d\n",y);
+			GDALExit(1);
+		}
 		// data read in. Now handle each pixel.
 		for(int x = 0; x < nXSize; x++){
 			unsigned short spix = pasScanlineStart[x];
@@ -191,7 +217,10 @@ int main(int argc, char **argv)
 		}
 
 		// write out the new line
-		poBandOut->RasterIO(GF_Write, 0,y,nXSize,1,pasScanlineOut,nXSize,1,GDT_UInt16, 0, 0);
+		if(poBandOut->RasterIO(GF_Write, 0,y,nXSize,1,pasScanlineOut,nXSize,1,GDT_UInt16, 0, 0) != CE_None){
+			fprintf(stderr,"Failed to write row %d to output\n",y);
+			GDALExit(1);
+		}
 	}
 
 	// set the historgram values in the RAT. Note RAT is ints and we could overflow
@@ -204,6 +233,21 @@ int main(int argc, char **argv)
 		//if(! poRAT->ChangesAreWrittenToFile()) { poBandOut->SetDefaultRAT(poRAT); }
 	}
 	
+	// check the color table
+	GDALColorTable *poTestColor = poBandOut->GetColorTable();
+	//if (! poTestColor->IsSame(poColorTable)){
+		fprintf(stderr,"Color table comparison\n");
+		for(int i = 0; i < poTestColor->GetColorEntryCount(); i++){
+			fprintf(stderr,"%d: ", i);
+			printRGB(poTestColor->GetColorEntry(i));
+			fprintf(stderr," vs ");
+			printRGB(poColorTable->GetColorEntry(i));
+			fprintf(stderr,"\n");
+		}
+	//}
+
+
+	GDALFlushCache( (GDALDatasetH)poBivariate );
 
 	// All done. Close properly
 	GDALClose((GDALDatasetH) poBivariate);
@@ -261,10 +305,29 @@ GDALColorTable * makeColorTable(char *psFilename)
 	}
 	
 	while(fscanf(fp, "%d %hu %hu %hu",&index, &color.c1,&color.c2,&color.c3) == 4){
-		color.c4 = index ? 1 : 0; // index 0 should be transparent for CCAP bivariate.
+		color.c4 = index ? 255 : 0; // index 0 should be transparent for CCAP bivariate.
+		color.c1 <<= 8;
+		color.c2 <<= 8;
+		color.c3 <<= 8;
 		poColorTable->SetColorEntry(index, &color);
 	}
 	fclose(fp);
 
 	return poColorTable;
+}
+
+void printRGB(const GDALColorEntry *color)
+{
+	fprintf(stderr,"%d %d %d %d",color->c1, color->c2, color->c3, color->c4);
+}
+
+
+char **getHFAoptions()
+{
+	char **papszOptions = NULL;
+	 papszOptions = CSLSetNameValue(papszOptions,"STATISTICS","TRUE");
+	 //papszOptions = CSLSetNameValue(papszOptions,"AUX", "TRUE");
+	 papszOptions = CSLSetNameValue(papszOptions,"COMPRESSED", "TRUE");
+
+	 return papszOptions;
 }
