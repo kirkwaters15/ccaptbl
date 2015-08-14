@@ -25,11 +25,13 @@ void printColorTable(GDALColorTable *poColorTable);
 
 void usage(char *name){
 	fprintf(stderr,"%s - calculate the bivariate CCAP file from the single date files\n",name);
-	fprintf(stderr,"USAGE: %s -c colorfile -s start_ccap -e end_ccap -o bivariate_file\n",name);
+	fprintf(stderr,"USAGE: %s [-c colorfile | -b bivariate_sample] -s start_ccap -e end_ccap -o bivariate_file\n",name);
 	fprintf(stderr,"\tcolorfile = 4 column space separated color file for bivariate (index red green blue)\n");
+	fprintf(stderr,"\tbivariate_sample = existing bivariate file with good raster attributes and colormap to copy\n");
 	fprintf(stderr,"\tstart_ccap = C-CAP file with first year of data\n");
 	fprintf(stderr,"\tend_ccap = C-CAP file with final year of data\n");
 	fprintf(stderr,"\tbivariate_file = C-CAP bivariate output file\n");
+	fprintf(stderr,"Note: use one of the colorfile or the bivariate_sample\n");
 
 }
 int main(int argc, char **argv)
@@ -41,6 +43,7 @@ int main(int argc, char **argv)
 	char *shpname = NULL;
 	char *fieldname = NULL;
 	char *psColorTable = NULL;
+	char *psRATBivarName = NULL;
 	FILE *tfp = stdout;
 	int verbose = 0;
 	GDALDataset *poStartCCAP = NULL;
@@ -66,7 +69,7 @@ int main(int argc, char **argv)
 
 	
 
-	while((c = getopt(argc,argv,"c:s:e:o:vh")) != -1){
+	while((c = getopt(argc,argv,"c:s:e:o:vhb:")) != -1){
 		switch(c){
 			case 'c':
 				psColorTable = optarg; // file name for a colortable (3 column)
@@ -87,6 +90,10 @@ int main(int argc, char **argv)
 					return 1;
 				}
 				break;
+			case 'b':
+				// existing bivariate file for the RAT
+				psRATBivarName = optarg;
+				break;
 			case 'o':
 				psBivariateName = optarg;
 				break;
@@ -96,6 +103,7 @@ int main(int argc, char **argv)
 			case 'h':
 				usage(argv[0]);
 				return 0;
+			case '?':
 			default:
 				fprintf(stderr,"unknown option -%c\n",c);
 				usage(argv[0]);
@@ -204,9 +212,11 @@ int main(int argc, char **argv)
 	}
 
 	// initialize the color table for bivariate if we can.
-	GDALDefaultRasterAttributeTable *poRAT = NULL;
+	
 	GDALColorTable *poColorTable = NULL;
 	if(psColorTable){
+		verbose && fprintf(stderr,"Assembling colortable from file %s\n",psColorTable);
+		GDALDefaultRasterAttributeTable *poRAT = NULL;
 		poRAT = new GDALDefaultRasterAttributeTable();
 		poColorTable = makeColorTable(psColorTable);
 			if(poColorTable != NULL){
@@ -220,7 +230,28 @@ int main(int argc, char **argv)
 			delete poRAT;
 			poRAT = NULL;
 		}
+	}else if(psRATBivarName){
+		verbose && fprintf(stderr,"Assembling RAT from sample file %s\n",psRATBivarName);
+		GDALDataset *poRATBivar = (GDALDataset *)GDALOpen( psRATBivarName, GA_ReadOnly );
+		if(poRATBivar == NULL){
+			fprintf(stderr,"Failed to open %s to copy the Raster Attribute Table\n",psRATBivarName);
+			GDALExit(1);
+		}
+		GDALRasterAttributeTable *poRAT = poRATBivar->GetRasterBand(1)->GetDefaultRAT();
+		poBandOut->SetDefaultRAT(poRAT);
+		poColorTable = poRATBivar->GetRasterBand(1)->GetColorTable();
+		if(poColorTable == NULL){
+			fprintf(stderr,"Sample bivariate missing color table ????\n");
+		}else{
+			poBandOut->SetColorInterpretation(GCI_PaletteIndex);
+			poBandOut->SetColorTable(poColorTable);
+			printColorTable(poColorTable);
+		}
+		
+	}else{
+		fprintf(stderr,"No info for RAT or colormap. Gonna be a sad looking file\n");
 	}
+
 	// allocate space for the histogram.
 	GUIntBig *anHistogram = (GUIntBig *)CPLMalloc(sizeof(GUIntBig) * (CCAP_CLASSES * CCAP_CLASSES + 1));
 	for (int i = 0; i < CCAP_CLASSES * CCAP_CLASSES; i++){ anHistogram[i] = 0;}
@@ -244,7 +275,7 @@ int main(int argc, char **argv)
 			unsigned short nclass;
 			nclass = spix && epix ? nclass = CCAP_CLASSES * (spix - 1) + (epix) : 0;
 			pasScanlineOut[x] = nclass;
-			if(nclass <= CCAP_CLASSES * CCAP_CLASSES)  anHistogram[nclass]++;
+			// if(nclass <= CCAP_CLASSES * CCAP_CLASSES)  anHistogram[nclass]++;
 		}
 
 		// write out the new line
@@ -254,8 +285,14 @@ int main(int argc, char **argv)
 		}
 	}
 
+	// compute the histogram
+	int nBuckets = CCAP_CLASSES * CCAP_CLASSES + 1;
+	double dfMin = -0.5; // first bucket is from -0.5 to 0.5, so center on zero
+	double dfMax = CCAP_CLASSES * CCAP_CLASSES + 0.5;
+	poBandOut->GetHistogram(dfMin, dfMax, nBuckets, anHistogram, 0, 0, GDALDummyProgress, NULL);
+
 	// set the historgram values in the RAT. Note RAT is ints and we could overflow
-	if(poRAT != NULL){
+	/*if(poRAT != NULL){
 		int histcol = poRAT->GetColOfUsage(GFU_PixelCount);
 		for (int i = 0; i < CCAP_CLASSES * CCAP_CLASSES; i++){
 			//fprintf(stderr,"Histogram %d => %ld\n",i,anHistogram[i]);
@@ -264,7 +301,7 @@ int main(int argc, char **argv)
 
 		poRAT->DumpReadable(NULL);
 		//if(! poRAT->ChangesAreWrittenToFile()) { poBandOut->SetDefaultRAT(poRAT); }
-	}
+	}*/
 	
 	// check the color table
 	/*GDALColorTable *poTestColor = poBandOut->GetColorTable();
@@ -356,6 +393,7 @@ void printRGB(const GDALColorEntry *color)
 
 void printColorTable(GDALColorTable *poColorTable)
 {
+	fprintf(stderr,"ColorTable with %d entries:\n",poColorTable->GetColorEntryCount());
 	for( int i = 0; i < poColorTable->GetColorEntryCount(); i++){
 		fprintf (stderr,"%d: ",i);
 		printRGB(poColorTable->GetColorEntry(i));
