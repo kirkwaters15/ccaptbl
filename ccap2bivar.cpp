@@ -19,7 +19,9 @@
 static int GDALExit( int nCode );
 GDALColorTable * makeColorTable(char *psFilename);
 void printRGB(const GDALColorEntry *color);
-char **getHFAoptions();
+char **getHFAOptions();
+char **getTiffOptions();
+void printColorTable(GDALColorTable *poColorTable);
 
 void usage(char *name){
 	fprintf(stderr,"%s - calculate the bivariate CCAP file from the single date files\n",name);
@@ -51,23 +53,15 @@ int main(int argc, char **argv)
 	extern int optind;
 	extern char *optarg;
 
-	const char *pszFormat = "HFA";
+	//const char *pszFormat = "HFA";
+	char gdalformat[10];
 	GDALDriver *poDriver;
 	char **papszMetadata;
 
 	GDALAllRegister();
 	OGRRegisterAll();
 
-	poDriver = GetGDALDriverManager()->GetDriverByName(pszFormat);
-
-  if( poDriver == NULL )
-      exit( 1 );
-
-  papszMetadata = poDriver->GetMetadata();
-  if( CSLFetchBoolean( papszMetadata, GDAL_DCAP_CREATE, FALSE ) )
-      printf( "Driver %s supports Create() method.\n", pszFormat );
-  if( CSLFetchBoolean( papszMetadata, GDAL_DCAP_CREATECOPY, FALSE ) )
-      printf( "Driver %s supports CreateCopy() method.\n", pszFormat );
+	
 	
 
 	
@@ -115,6 +109,40 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	// figure out the format for the output
+	if(psBivariateName == NULL){
+		fprintf(stderr,"Must supply output file name\n");
+		usage(argv[0]);
+		return 1;
+	}
+	char **papszOptions = NULL;
+	
+	const char * psLastPeriod = strrchr(psBivariateName,'.');
+	if(strcasecmp(psLastPeriod,".img") == 0){
+		strcpy(gdalformat,"HFA");
+		papszOptions = getHFAOptions();
+	}else if(strcasecmp(psLastPeriod,".tif") == 0){
+		strcpy(gdalformat,"GTiff");
+		papszOptions = getTiffOptions();
+	}else{
+		fprintf(stderr,"Not supported output format yet\n");
+		return 1;
+	}
+
+	// validate that we can use create
+	poDriver = GetGDALDriverManager()->GetDriverByName(gdalformat);
+
+  if( poDriver == NULL )
+      return 1;
+
+  papszMetadata = poDriver->GetMetadata();
+  if( ! CSLFetchBoolean( papszMetadata, GDAL_DCAP_CREATE, FALSE ) ) {
+  	printf( "Driver %s does not support Create() method.\n", gdalformat );
+  	return 1;
+  }
+      
+
+
 	// Validate that the input rasters are the same size, etc. 
 	if(poEndCCAP->GetRasterXSize() != poStartCCAP->GetRasterXSize() 
 		|| poEndCCAP->GetRasterYSize() != poStartCCAP->GetRasterYSize()){
@@ -128,8 +156,7 @@ int main(int argc, char **argv)
 	* Want to create an output file the same size as the input files,
 	* but with 16 bit unsigned instead of 8 bit.
 	*/
-	char **papszOptions = NULL;
-	papszOptions = getHFAoptions();
+	
 	if( (poBivariate = poDriver->Create(psBivariateName, nXSize, nYSize, 1,
 		GDT_UInt16,papszOptions)) == NULL){
 		fprintf(stderr,"Failed to created output file %s\n",psBivariateName);
@@ -166,6 +193,10 @@ int main(int argc, char **argv)
 	GDALRasterBand *poBandEnd = poEndCCAP->GetRasterBand( 1 );
 	GDALRasterBand *poBandOut = poBivariate->GetRasterBand( 1 );
 
+	// look at what a color table looks like
+	//printColorTable(poBandEnd->GetColorTable());
+
+
 	if(poBandStart == NULL || poBandEnd == NULL || poBandOut == NULL){
 		fprintf(stderr,"Failed to get one of the bands!\n");
 		GDALExit(1);
@@ -173,10 +204,10 @@ int main(int argc, char **argv)
 	}
 
 	// initialize the color table for bivariate if we can.
-	GDALRasterAttributeTable *poRAT = NULL;
+	GDALDefaultRasterAttributeTable *poRAT = NULL;
 	GDALColorTable *poColorTable = NULL;
 	if(psColorTable){
-		poRAT = new GDALRasterAttributeTable();
+		poRAT = new GDALDefaultRasterAttributeTable();
 		poColorTable = makeColorTable(psColorTable);
 			if(poColorTable != NULL){
 			poRAT->InitializeFromColorTable(poColorTable);
@@ -213,7 +244,7 @@ int main(int argc, char **argv)
 			unsigned short nclass;
 			nclass = spix && epix ? nclass = CCAP_CLASSES * (spix - 1) + (epix) : 0;
 			pasScanlineOut[x] = nclass;
-			nclass <= CCAP_CLASSES * CCAP_CLASSES && anHistogram[nclass]++;
+			if(nclass <= CCAP_CLASSES * CCAP_CLASSES)  anHistogram[nclass]++;
 		}
 
 		// write out the new line
@@ -227,14 +258,16 @@ int main(int argc, char **argv)
 	if(poRAT != NULL){
 		int histcol = poRAT->GetColOfUsage(GFU_PixelCount);
 		for (int i = 0; i < CCAP_CLASSES * CCAP_CLASSES; i++){
-			anHistogram[i] < INT_MAX ? poRAT->SetValue(i,histcol,(int)anHistogram[i]) : poRAT->SetValue(i,histcol,INT_MAX);
+			//fprintf(stderr,"Histogram %d => %ld\n",i,anHistogram[i]);
+			poRAT->SetValue(i,histcol,(int)anHistogram[i]) ;
 		}
 
+		poRAT->DumpReadable(NULL);
 		//if(! poRAT->ChangesAreWrittenToFile()) { poBandOut->SetDefaultRAT(poRAT); }
 	}
 	
 	// check the color table
-	GDALColorTable *poTestColor = poBandOut->GetColorTable();
+	/*GDALColorTable *poTestColor = poBandOut->GetColorTable();
 	//if (! poTestColor->IsSame(poColorTable)){
 		fprintf(stderr,"Color table comparison\n");
 		for(int i = 0; i < poTestColor->GetColorEntryCount(); i++){
@@ -243,7 +276,7 @@ int main(int argc, char **argv)
 			fprintf(stderr," vs ");
 			printRGB(poColorTable->GetColorEntry(i));
 			fprintf(stderr,"\n");
-		}
+		}*/
 	//}
 
 
@@ -305,10 +338,10 @@ GDALColorTable * makeColorTable(char *psFilename)
 	}
 	
 	while(fscanf(fp, "%d %hu %hu %hu",&index, &color.c1,&color.c2,&color.c3) == 4){
-		color.c4 = index ? 255 : 0; // index 0 should be transparent for CCAP bivariate.
-		color.c1 <<= 8;
-		color.c2 <<= 8;
-		color.c3 <<= 8;
+		color.c4 = index ? 1 : 0; // index 0 should be transparent for CCAP bivariate.
+		//color.c1 <<= 8;
+		//color.c2 <<= 8;
+		//color.c3 <<= 8;
 		poColorTable->SetColorEntry(index, &color);
 	}
 	fclose(fp);
@@ -321,13 +354,29 @@ void printRGB(const GDALColorEntry *color)
 	fprintf(stderr,"%d %d %d %d",color->c1, color->c2, color->c3, color->c4);
 }
 
+void printColorTable(GDALColorTable *poColorTable)
+{
+	for( int i = 0; i < poColorTable->GetColorEntryCount(); i++){
+		fprintf (stderr,"%d: ",i);
+		printRGB(poColorTable->GetColorEntry(i));
+		fprintf (stderr,"\n");
+	}
+}
 
-char **getHFAoptions()
+char **getHFAOptions()
 {
 	char **papszOptions = NULL;
 	 papszOptions = CSLSetNameValue(papszOptions,"STATISTICS","TRUE");
 	 //papszOptions = CSLSetNameValue(papszOptions,"AUX", "TRUE");
 	 papszOptions = CSLSetNameValue(papszOptions,"COMPRESSED", "TRUE");
+
+	 return papszOptions;
+}
+
+char **getTiffOptions()
+{
+	char **papszOptions = NULL;
+	 papszOptions = CSLSetNameValue(papszOptions,"COMPRESS", "PACKBITS");
 
 	 return papszOptions;
 }
